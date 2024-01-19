@@ -197,8 +197,8 @@ def run_eval(args: EvalArguments):
     np.random.seed(seed)
 
     dataset = Pg19Dataset(args.data_path, seq_length=args.seq_len, sliding_window=256)
-    if args.flash_attn:
-        replace_llama_attn(use_flash_attn=True, use_full=True)
+    # if args.flash_attn:
+    #     replace_llama_attn(use_flash_attn=True, use_full=True)
 
     # Set RoPE scaling factor
     config = transformers.AutoConfig.from_pretrained(
@@ -206,6 +206,7 @@ def run_eval(args: EvalArguments):
         cache_dir=args.cache_dir,
         use_cache=False
     )
+    config._attn_implementation = "flash_attention_2"
 
     context_size = args.context_size if args.context_size > 0 else args.seq_len
     orig_ctx_len = getattr(config, "max_position_embeddings", None)  # this value should be 4096 for LLaMA2 models
@@ -251,6 +252,7 @@ def run_eval(args: EvalArguments):
         print("data path", args.data_path)
         print("base model", args.base_model)
         print("peft model", args.peft_model)
+        print("batch size", args.batch_size)
         print(f"Num validation tokens: {dataset.num_tokens()}, Num validation examples: {len(dataset)}")
 
     eval_metric = EvalMetricImpl(vocab_size=config.vocab_size, gpu_id=gpu_id)

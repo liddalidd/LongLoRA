@@ -126,15 +126,18 @@ def main(args):
     print("data path", args.data_path)
     print("base model", args.base_model)
     print("peft model", args.peft_model)
+    print("batch size", args.batch_size)
 
-    if args.flash_attn:
-        replace_llama_attn(use_flash_attn=True, use_full=True)
+    # if args.flash_attn:
+    #     replace_llama_attn(use_flash_attn=True, use_full=True)
 
     # Set RoPE scaling factor
     config = transformers.AutoConfig.from_pretrained(
         args.base_model,
         cache_dir=args.cache_dir,
     )
+    config._attn_implementation = "flash_attention_2"
+
 
     context_size = args.context_size if args.context_size > 0 else args.seq_len
     orig_ctx_len = getattr(config, "max_position_embeddings", None) # this value should be 4096 for LLaMA2 models
@@ -151,6 +154,7 @@ def main(args):
         device_map="auto",
     )
     model.resize_token_embeddings(32001)
+    model.to("cuda")
 
     if args.peft_model:
         trainable_params = os.path.join(args.peft_model, "trainable_params.bin")

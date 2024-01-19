@@ -17,7 +17,7 @@ import os
 import math
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, List
 
 import torch
 import transformers
@@ -28,6 +28,11 @@ from gptneox_attn_replace import replace_gpt_neox_attn
 from peft import LoraConfig, get_peft_model
 from torch.distributed import barrier
 
+from transformers.trainer_utils import is_main_process
+import torch.distributed as dist
+from loguru import logger
+
+
 
 from datasets import load_dataset
 
@@ -36,6 +41,9 @@ DEFAULT_PAD_TOKEN = "[PAD]"
 DEFAULT_EOS_TOKEN = "</s>"
 DEFAULT_BOS_TOKEN = "<s>"
 DEFAULT_UNK_TOKEN = "<unk>"
+
+import warnings
+warnings.filterwarnings("ignore")
 
 
 @dataclass
@@ -67,6 +75,29 @@ class TrainingArguments(transformers.TrainingArguments):
         default="embed,norm",
         metadata={"help": "Additional trainable parameters except LoRA weights, if low rank training."},
     )
+    # LD ADD
+    train_data: str = field(
+        default="togethercomputer/RedPajama-Data-1T-Sample",
+        metadata={"help": "Training data path"},
+    )
+    local_training_path: str = field(
+        default="togethercomputer/RedPajama-Data-1T-Sample",
+        metadata={"help": "local training data path"},
+    )
+    full_window_idx: int = field(
+        default=-1,
+        metadata={"help": "Position of full attention"},
+    )
+    window_size: int = field(
+        default=256,
+        metadata={"help": "window attention size"},
+    )
+
+
+def print_fn(info):
+    rank = int(os.environ.get('RANK', -1))
+    if rank == 0:
+        logger.info(info)
 
 def smart_tokenizer_and_embedding_resize(
     special_tokens_dict: Dict,
@@ -105,18 +136,27 @@ def train():
     parser = transformers.HfArgumentParser((ModelArguments, TrainingArguments))
     model_args, training_args = parser.parse_args_into_dataclasses()
 
+    training_args.disable_tqdm = True
+
     # NOTE: May expand supported model types in the future
-    if model_args.model_type == "gpt-neox":
-        replace_gpt_neox_attn(training_args.use_flash_attn, training_args.use_full_attn)
-    else:
-        assert model_args.model_type == "llama", "Only support llama and gpt-neox for now"
-        replace_llama_attn(training_args.use_flash_attn, training_args.use_full_attn)
+    # if model_args.model_type == "gpt-neox":
+    #     replace_gpt_neox_attn(training_args.use_flash_attn, training_args.use_full_attn)
+    # else:
+    #     assert model_args.model_type == "llama", "Only support llama and gpt-neox for now"
+    #     replace_llama_attn(training_args.use_flash_attn, training_args.use_full_attn)
 
     # Set RoPE scaling factor
     config = transformers.AutoConfig.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
     )
+    config.window_size = training_args.window_size
+    config.full_window_idx = training_args.full_window_idx
+        
+    window_size_list = [config.window_size for _ in range(config.num_hidden_layers)]
+    window_size_list[config.full_window_idx] = -1
+    config.window_size_list = window_size_list
+    print_fn(config)
 
     orig_rope_scaling = getattr(config, "rope_scaling", None)
     if orig_rope_scaling is None:
@@ -130,6 +170,8 @@ def train():
             scaling_factor = float(math.ceil(training_args.model_max_length / orig_ctx_len))
             config.rope_scaling = {"type": "linear", "factor": scaling_factor}
 
+    config._attn_implementation = "flash_attention_2"
+
     # Load model and tokenizer
     model = transformers.AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
@@ -137,6 +179,8 @@ def train():
         cache_dir=training_args.cache_dir,
         torch_dtype=torch.bfloat16,
     )
+    model.to("cuda")
+    print_fn(model)
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
@@ -145,6 +189,7 @@ def train():
         padding_side="right",
         use_fast=True,
     )
+    print_fn(tokenizer)
 
     special_tokens_dict = dict()
     if tokenizer.pad_token is None:
@@ -165,13 +210,22 @@ def train():
     rank = int(os.environ.get('RANK', -1))
     if rank > 0:
         barrier()
-    dataset = load_dataset("togethercomputer/RedPajama-Data-1T-Sample", cache_dir=training_args.cache_dir)
-    dataset = dataset.map(partial(tokenize_fn,tokenizer),batched=True, num_proc=128, remove_columns=["text", "meta"])
+        
+    # online process
+    # dataset = load_dataset(training_args.train_data, cache_dir=training_args.cache_dir)
+    # dataset = dataset.map(partial(tokenize_fn, tokenizer),batched=True, num_proc=128, remove_columns=["text", "meta"])
+    # dataset.save_to_disk(some/path)
+        
+    # off-line load    
+    len_version = training_args.model_max_length // 1024
+    encoded_path = f"{training_args.local_training_path}/{len_version}k"
+    print_fn(f"loading dataset from {encoded_path}...")
+    dataset = load_dataset(encoded_path)
 
     if rank == 0:
         barrier()
 
-    print(dataset)
+    print_fn(dataset)
 
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
@@ -202,7 +256,13 @@ def train():
         train_dataset=dataset["train"],
         eval_dataset=None,
         data_collator=data_collator)
-    trainer.train()
+    
+    train_result = trainer.train(resume_from_checkpoint=True)
+    metrics = train_result.metrics
+
+    trainer.log_metrics("train", metrics)
+    trainer.save_metrics("train", metrics)
+
     trainer.save_state()
     trainer.save_model(output_dir=training_args.output_dir)
 
