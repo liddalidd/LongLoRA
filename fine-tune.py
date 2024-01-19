@@ -22,14 +22,14 @@ from typing import Dict, Optional, Sequence
 import torch
 import transformers
 from torch.utils.data import Dataset
-from transformers import Trainer, DataCollatorForLanguageModeling
+from transformers import Trainer, DataCollatorForLanguageModeling, set_seed
 from llama_attn_replace import replace_llama_attn
 from gptneox_attn_replace import replace_gpt_neox_attn
 from peft import LoraConfig, get_peft_model
 from torch.distributed import barrier
-
-
-from datasets import load_dataset
+import numpy as np
+from transformers.trainer_utils import get_last_checkpoint
+from datasets import load_dataset   
 
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
@@ -67,6 +67,14 @@ class TrainingArguments(transformers.TrainingArguments):
         default="embed,norm",
         metadata={"help": "Additional trainable parameters except LoRA weights, if low rank training."},
     )
+    window_size_dir: str = field(
+        default="",
+        metadata={"help": "Directory of window size files."},
+    )
+    use_log_metrics: bool = field(
+        default=True,
+        metadata={"help": "Whether to use log metrics."},
+    )
 
 def smart_tokenizer_and_embedding_resize(
     special_tokens_dict: Dict,
@@ -102,10 +110,21 @@ def tokenize_fn(tokenizer, example):
     return {"input_ids": outputs["input_ids"].view(-1, context_length)}
 
 def train():
+    
     parser = transformers.HfArgumentParser((ModelArguments, TrainingArguments))
     model_args, training_args = parser.parse_args_into_dataclasses()
-
+    # load a list element from window_size_dir
+    set_seed(training_args.seed)
+    print('Using seed: ', training_args.seed)
+    window_size = np.load(training_args.window_size_dir).tolist()
     # NOTE: May expand supported model types in the future
+    print("model max length: ", training_args.model_max_length)
+    last_checkpoint = None
+    if os.path.isdir(training_args.output_dir):
+        last_checkpoint = get_last_checkpoint(training_args.output_dir)
+        if last_checkpoint is not None:
+            print(f"Checkpoint detected, resuming training at {last_checkpoint}.")
+
     if model_args.model_type == "gpt-neox":
         replace_gpt_neox_attn(training_args.use_flash_attn, training_args.use_full_attn)
     else:
@@ -116,6 +135,7 @@ def train():
     config = transformers.AutoConfig.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
+        window_size=window_size,
     )
 
     orig_rope_scaling = getattr(config, "rope_scaling", None)
@@ -165,9 +185,16 @@ def train():
     rank = int(os.environ.get('RANK', -1))
     if rank > 0:
         barrier()
-    dataset = load_dataset("togethercomputer/RedPajama-Data-1T-Sample", cache_dir=training_args.cache_dir)
-    dataset = dataset.map(partial(tokenize_fn,tokenizer),batched=True, num_proc=128, remove_columns=["text", "meta"])
+    if training_args.model_max_length == 8192:
+        dataset = load_dataset("/mnt/petrelfs/share_data/lidong/data/enc-red/8k", cache_dir=training_args.cache_dir)
+    elif training_args.model_max_length == 16384:
+        dataset = load_dataset("/mnt/petrelfs/yangchenyu/RedPajama-Data-1T-Sample", cache_dir=training_args.cache_dir)
+        dataset = dataset.map(partial(tokenize_fn,tokenizer), num_proc=128, remove_columns=["text", "meta"])
+        dataset.save_to_disk("enc-red/16k")         
+    elif training_args.model_max_length == 32768:
+        dataset = load_dataset("/mnt/petrelfs/share_data/lidong/data/enc-red/32k", cache_dir=training_args.cache_dir)
 
+        
     if rank == 0:
         barrier()
 
@@ -202,7 +229,10 @@ def train():
         train_dataset=dataset["train"],
         eval_dataset=None,
         data_collator=data_collator)
-    trainer.train()
+    train_result = trainer.train(resume_from_checkpoint=last_checkpoint)
+    if training_args.use_log_metrics:
+        trainer.log_metrics("train", train_result.metrics)
+        trainer.save_metrics("train", train_result.metrics)
     trainer.save_state()
     trainer.save_model(output_dir=training_args.output_dir)
 

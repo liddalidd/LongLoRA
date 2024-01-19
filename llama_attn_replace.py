@@ -17,6 +17,7 @@ from flash_attn.flash_attn_interface import (
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv, rotate_half
 from flash_attn.bert_padding import unpad_input, pad_input
 import math
+from torch.nn import functional as F
 
 group_size_ratio = 1/4
 def forward_flashattn(
@@ -97,7 +98,7 @@ def forward_flashattn(
     nheads = qkv.shape[-2]
     # shift
 
-    group_size = int(q_len * group_size_ratio)
+    group_size = self.window_size[self.layer_idx] if self.window_size[self.layer_idx] != -1 else q_len
     if q_len % group_size > 0:
         raise ValueError("q_len %d should be divisible by group size %d." % (q_len, group_size))
 
@@ -108,7 +109,8 @@ def forward_flashattn(
     x = rearrange(qkv, "b s three h d -> b s (three h d)")
     x_unpad, indices, cu_q_lens, max_s = unpad_input(x, key_padding_mask)
     cu_q_len_tmp = torch.arange(0, max_s, group_size, device=key_padding_mask.device, dtype=cu_q_lens.dtype)
-    cu_q_len_tmp = torch.stack([cu_q_len_tmp, cu_q_len_tmp + group_size // 2]).repeat(bsz, 1) + cu_q_lens[:-1].unsqueeze(-1)
+    # cu_q_len_tmp = torch.stack([cu_q_len_tmp, cu_q_len_tmp + group_size // 2]).repeat(bsz, 1) + cu_q_lens[:-1].unsqueeze(-1)
+    cu_q_len_tmp = torch.stack([cu_q_len_tmp, cu_q_len_tmp]).repeat(bsz, 1) + cu_q_lens[:-1].unsqueeze(-1)
     cu_q_lens = torch.cat([cu_q_len_tmp, cu_q_lens[1:].unsqueeze(-1)], dim=-1).view(-1)
 
     x_unpad = rearrange(

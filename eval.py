@@ -23,6 +23,9 @@ from tqdm import tqdm
 import transformers
 from peft import PeftModel
 from llama_attn_replace import replace_llama_attn
+import json
+import re
+
 
 def parse_config():
     parser = argparse.ArgumentParser(description='arg parser')
@@ -37,11 +40,14 @@ def parse_config():
     args = parser.parse_args()
     return args
 
-def get_as_batch(data, seq_length, batch_size, device='cpu', sliding_window=256):
+def get_as_batch(data, seq_length, batch_size, device='cpu', sliding_window=256, resume_ckpt=None):
     all_ix = list(range(0, len(data) - seq_length, sliding_window))
     all_ix.pop()
-
-    for idx in range(0, len(all_ix), batch_size):
+    if resume_ckpt == None:
+        resume_ckpt = 0
+    else:
+        resume_ckpt += batch_size
+    for idx in range(resume_ckpt, len(all_ix), batch_size):
         ix = all_ix[idx:idx+batch_size]
         assert all([idx + seq_length + 1 <= len(data) for idx in ix])
         x = torch.stack([torch.from_numpy((data[i:i+seq_length]).astype(np.int64)) for i in ix])
@@ -50,16 +56,32 @@ def get_as_batch(data, seq_length, batch_size, device='cpu', sliding_window=256)
             x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
         yield x, y
 
-def iceildiv(x, y):
-    return (x + y - 1) // y
+def val_step_num(data, batch_size, seq_length, sliding_window, resume_ckpt):
+    temp = np.ceil((len(data) - seq_length) / sliding_window) - 1
+    resume_ckpt =  resume_ckpt + batch_size if resume_ckpt is not None else 0
+    return int(np.ceil((temp - resume_ckpt) / batch_size) + 1)
 
-def evaluate(model, data, batch_size, device, seq_length, sliding_window=256, use_cache=False):
+
+def evaluate(model, data, batch_size, device, seq_length, sliding_window=256, use_cache=False, save_steps=2000):
     stats = {}
 
     model.eval()
 
     loss_list_val, acc_list = [], []
     loss_step_list_val = []
+    resume_ckpt = None
+    resume_idx = None
+    # load from ckpt
+    if os.path.exists(os.path.join(args.peft_model, f"eval_ckpt_{args.seq_len}_{args.context_size}")):
+        eval_path = os.path.join(args.peft_model, f"eval_ckpt_{args.seq_len}_{args.context_size}")
+        eval_list = os.listdir(eval_path)
+        eval_list.sort(key=lambda x: int(re.findall(r'\d+', x)[0]))
+        resume_ckpt = eval_list[-1]
+        print(f'Resume from eval ckpt:{resume_ckpt}')
+        resume_idx = int(re.findall(r'\d+', resume_ckpt)[0])
+        loss_step_list_val = np.load(os.path.join(eval_path, resume_ckpt, "loss_step_list_val.npy"), allow_pickle=True).tolist()
+        loss_list_val = np.load(os.path.join(eval_path, resume_ckpt, "loss_list_val.npy"), allow_pickle=True).tolist()
+        acc_list = np.load(os.path.join(eval_path, resume_ckpt, "acc_list.npy"), allow_pickle=True).tolist()
 
     with torch.no_grad():
         print(f"Using seq length {seq_length}")
@@ -71,14 +93,14 @@ def evaluate(model, data, batch_size, device, seq_length, sliding_window=256, us
                     seq_length, 
                     batch_size, 
                     device=device,
-                    sliding_window=sliding_window
+                    sliding_window=sliding_window,
+                    resume_ckpt=resume_idx
                 )
             ),
-            total=iceildiv(
-                iceildiv(len(data['val']), sliding_window),
-                batch_size
-            )
+            total=val_step_num(data['val'], batch_size, seq_length, sliding_window, resume_idx)
         ):
+            idx = idx + resume_idx if resume_idx is not None else idx
+            # print(idx)
             val_loss = 0.
             acc = 0.
             cnt = 0
@@ -102,6 +124,16 @@ def evaluate(model, data, batch_size, device, seq_length, sliding_window=256, us
             
             loss_list_val.append(val_loss.item())
             acc_list.append(acc.item())
+            # print(idx, resume_ckpt)
+            if idx % 200 == 0 and ((idx != resume_idx and resume_idx != None) or (idx != 0 and resume_idx == None)):
+                eval_path = os.path.join(args.peft_model, f"eval_ckpt_{args.seq_len}_{args.context_size}")
+                if not os.path.exists(eval_path):
+                    os.mkdir(eval_path)
+                os.mkdir(os.path.join(eval_path, f"eval_{idx}"))
+                np.save(os.path.join(eval_path, f"eval_{idx}", "loss_step_list_val.npy"), loss_step_list_val)
+                np.save(os.path.join(eval_path, f"eval_{idx}", "loss_list_val.npy"), loss_list_val)
+                np.save(os.path.join(eval_path, f"eval_{idx}", "acc_list.npy"), acc_list)
+                print(f'eval ckpt "eval_{idx}" saved ')
 
     stats['val_acc'] = torch.as_tensor(acc_list).mean().item()
     stats['val_loss'] = torch.as_tensor(loss_list_val).mean().item()
@@ -168,6 +200,7 @@ def main(args):
     stats = evaluate(model, data, args.batch_size, device, args.seq_len, sliding_window=256)
 
     print(stats)
+    json.dump(stats, open(os.path.join(args.peft_model,f"eval_stats_{args.seq_len}_{args.context_size}.json"), "w"))
 
 
 if __name__ == "__main__":
