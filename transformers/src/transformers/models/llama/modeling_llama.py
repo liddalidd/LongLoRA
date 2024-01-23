@@ -18,7 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """ PyTorch LLaMA model."""
-import math
+import math, os
 import warnings
 from typing import List, Optional, Tuple, Union
 
@@ -64,6 +64,12 @@ if is_torch_fx_available():
 
     _prepare_4d_causal_attention_mask = torch.fx.wrap(_prepare_4d_causal_attention_mask)
 
+from loguru import logger as loggger
+
+def print_fn(info):
+    rank = int(os.environ.get('RANK', -1))
+    if rank == 0:
+        loggger.info(info)
 
 logger = logging.get_logger(__name__)
 
@@ -307,6 +313,7 @@ class LlamaAttention(nn.Module):
         self.is_causal = True
         # LD ADD
         self.window_size = config.window_size_list[layer_idx]
+        print_fn(f"layer: {layer_idx} window size: {self.window_size}")
 
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
@@ -555,12 +562,9 @@ class LlamaFlashAttention2(LlamaAttention):
         else:
             window_size = (self.window_size, 0)
 
-        
         window_atten_output = flash_attn_func(query_states, key_states, value_states, causal=True, window_size=window_size)
         attn_output = window_atten_output.reshape(bsz, q_len, self.hidden_size).contiguous()
-        
         # ADD Done
-        
 
         # attn_output = self._flash_attention_forward(
         #     query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
@@ -770,11 +774,7 @@ class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-
-        # LD ADD
-        
         self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
-
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)

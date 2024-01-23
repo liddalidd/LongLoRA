@@ -25,13 +25,14 @@ from torch.utils.data import Dataset
 from transformers import Trainer, DataCollatorForLanguageModeling
 from llama_attn_replace import replace_llama_attn
 from gptneox_attn_replace import replace_gpt_neox_attn
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, set_peft_model_state_dict, get_peft_model_state_dict
 from torch.distributed import barrier
 
 from transformers.trainer_utils import is_main_process
 import torch.distributed as dist
 from loguru import logger
 
+logger.info(transformers.__path__)
 
 
 from datasets import load_dataset
@@ -81,7 +82,7 @@ class TrainingArguments(transformers.TrainingArguments):
         metadata={"help": "Training data path"},
     )
     local_training_path: str = field(
-        default="togethercomputer/RedPajama-Data-1T-Sample",
+        default=None,
         metadata={"help": "local training data path"},
     )
     full_window_idx: int = field(
@@ -91,6 +92,10 @@ class TrainingArguments(transformers.TrainingArguments):
     window_size: int = field(
         default=256,
         metadata={"help": "window attention size"},
+    )
+    resume: bool = field(
+        default=False,
+        metadata={"help": "whether to resume from checkpoint"},
     )
 
 
@@ -212,15 +217,16 @@ def train():
         barrier()
         
     # online process
-    # dataset = load_dataset(training_args.train_data, cache_dir=training_args.cache_dir)
-    # dataset = dataset.map(partial(tokenize_fn, tokenizer),batched=True, num_proc=128, remove_columns=["text", "meta"])
-    # dataset.save_to_disk(some/path)
-        
+    if not training_args.local_training_path:
+        dataset = load_dataset(training_args.train_data, cache_dir=training_args.cache_dir)
+        dataset = dataset.map(partial(tokenize_fn, tokenizer),batched=True, num_proc=128, remove_columns=["text", "meta"])
+        # dataset.save_to_disk(some/path)
+    else:
     # off-line load    
-    len_version = training_args.model_max_length // 1024
-    encoded_path = f"{training_args.local_training_path}/{len_version}k"
-    print_fn(f"loading dataset from {encoded_path}...")
-    dataset = load_dataset(encoded_path)
+        len_version = training_args.model_max_length // 1024
+        encoded_path = f"{training_args.local_training_path}/{len_version}k"
+        print_fn(f"loading dataset from {encoded_path}...")
+        dataset = load_dataset(encoded_path)
 
     if rank == 0:
         barrier()
@@ -244,20 +250,33 @@ def train():
             bias="none",
             task_type="CAUSAL_LM",
         )
+        print_fn(config)
         model = get_peft_model(model, config)
+ 
         # enable trainable params
-        [p.requires_grad_() for n, p in model.named_parameters() if any([k in n for k in training_args.trainable_params.split(",")])]
+        # [p.requires_grad_() for n, p in model.named_parameters() if any([k in n for k in training_args.trainable_params.split(",")])]
+    model.print_trainable_parameters()
 
     model.config.use_cache = False         # required for gradient checkpointing
     model.enable_input_require_grads()     # required for gradient checkpointing
     model.gradient_checkpointing_enable()  # enable gradient checkpointing
+
+    print_fn(model)
+    # old_state_dict = model.state_dict
+    # model.state_dict = (
+    #     lambda self, *_, **__: get_peft_model_state_dict(
+    #         self, old_state_dict()
+    #     )
+    # ).__get__(model, type(model))
+
     trainer = Trainer(
         model=model, tokenizer=tokenizer, args=training_args,
         train_dataset=dataset["train"],
         eval_dataset=None,
         data_collator=data_collator)
     
-    train_result = trainer.train(resume_from_checkpoint=True)
+    resume_from_checkpoint = training_args.resume
+    train_result = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     metrics = train_result.metrics
 
     trainer.log_metrics("train", metrics)

@@ -140,6 +140,7 @@ def main(args):
 
 
     context_size = args.context_size if args.context_size > 0 else args.seq_len
+    print(f"context size", context_size)
     orig_ctx_len = getattr(config, "max_position_embeddings", None) # this value should be 4096 for LLaMA2 models
     if orig_ctx_len and context_size > orig_ctx_len:
         scaling_factor = float(math.ceil(context_size / orig_ctx_len))
