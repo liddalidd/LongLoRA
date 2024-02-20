@@ -22,14 +22,17 @@ from typing import Dict, Optional, Sequence
 import torch
 import transformers
 from torch.utils.data import Dataset
-from transformers import Trainer, DataCollatorForLanguageModeling, set_seed
+from transformers import Trainer, DataCollatorForLanguageModeling
 from llama_attn_replace import replace_llama_attn
 from gptneox_attn_replace import replace_gpt_neox_attn
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, set_peft_model_state_dict, get_peft_model_state_dict
 from torch.distributed import barrier
-import numpy as np
 from transformers.trainer_utils import get_last_checkpoint
-from datasets import load_dataset   
+
+from datasets import load_dataset
+from loguru import logger
+
+logger.info(transformers.__path__)
 
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
@@ -67,14 +70,31 @@ class TrainingArguments(transformers.TrainingArguments):
         default="embed,norm",
         metadata={"help": "Additional trainable parameters except LoRA weights, if low rank training."},
     )
-    window_size_dir: str = field(
-        default="",
-        metadata={"help": "Directory of window size files."},
+    train_data: str = field(
+        default="togethercomputer/RedPajama-Data-1T-Sample",
+        metadata={"help": "Training data path"},
     )
-    use_log_metrics: bool = field(
+    local_training_path: str = field(
+        default=None,
+        metadata={"help": "local training data path"},
+    )
+    window_size: int = field(
+        default=256,
+        metadata={"help":"window attention size"}
+    )
+    full_window_idx: int = field(
+        default=-1,
+        metadata={"help": "The index of the full window if using full attention."},
+    )
+    resume: bool = field(
         default=True,
-        metadata={"help": "Whether to use log metrics."},
+        metadata={"help": "whether to resume from checkpoint"},
     )
+
+def print_fn(info):
+    rank = int(os.environ.get('RANK', -1))
+    if rank == 0:
+        logger.info(info)
 
 def smart_tokenizer_and_embedding_resize(
     special_tokens_dict: Dict,
@@ -110,33 +130,33 @@ def tokenize_fn(tokenizer, example):
     return {"input_ids": outputs["input_ids"].view(-1, context_length)}
 
 def train():
-    
     parser = transformers.HfArgumentParser((ModelArguments, TrainingArguments))
     model_args, training_args = parser.parse_args_into_dataclasses()
-    # load a list element from window_size_dir
-    set_seed(training_args.seed)
-    print('Using seed: ', training_args.seed)
-    window_size = np.load(training_args.window_size_dir).tolist()
-    # NOTE: May expand supported model types in the future
-    print("model max length: ", training_args.model_max_length)
-    last_checkpoint = None
-    if os.path.isdir(training_args.output_dir):
-        last_checkpoint = get_last_checkpoint(training_args.output_dir)
-        if last_checkpoint is not None:
-            print(f"Checkpoint detected, resuming training at {last_checkpoint}.")
 
-    if model_args.model_type == "gpt-neox":
-        replace_gpt_neox_attn(training_args.use_flash_attn, training_args.use_full_attn)
-    else:
-        assert model_args.model_type == "llama", "Only support llama and gpt-neox for now"
-        replace_llama_attn(training_args.use_flash_attn, training_args.use_full_attn)
+    last_checkpoint = get_last_checkpoint(training_args.output_dir) if training_args.resume else None
+    if last_checkpoint is not None:
+        print_fn(f"resume from {last_checkpoint}")
+    # NOTE: May expand supported model types in the future
+    # if model_args.model_type == "gpt-neox":
+    #     replace_gpt_neox_attn(training_args.use_flash_attn, training_args.use_full_attn)
+    # else:
+    #     assert model_args.model_type == "llama", "Only support llama and gpt-neox for now"
+    #     replace_llama_attn(training_args.use_flash_attn, training_args.use_full_attn)
 
     # Set RoPE scaling factor
     config = transformers.AutoConfig.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
-        window_size=window_size,
     )
+    config._attn_implementation = "flash_attention_2"
+    config._flash_attn_2_enabled = True
+    config.full_window_idx = training_args.full_window_idx
+    config.window_size = training_args.window_size
+
+    window_size_list = [config.window_size for _ in range(config.num_hidden_layers)]
+    window_size_list[config.full_window_idx] = -1
+    config.window_size_list = window_size_list
+    print_fn(config)
 
     orig_rope_scaling = getattr(config, "rope_scaling", None)
     if orig_rope_scaling is None:
@@ -157,7 +177,7 @@ def train():
         cache_dir=training_args.cache_dir,
         torch_dtype=torch.bfloat16,
     )
-
+    print_fn(model)
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
@@ -165,7 +185,7 @@ def train():
         padding_side="right",
         use_fast=True,
     )
-
+    print_fn(tokenizer)
     special_tokens_dict = dict()
     if tokenizer.pad_token is None:
         special_tokens_dict["pad_token"] = DEFAULT_PAD_TOKEN
@@ -185,20 +205,24 @@ def train():
     rank = int(os.environ.get('RANK', -1))
     if rank > 0:
         barrier()
-    if training_args.model_max_length == 8192:
-        dataset = load_dataset("/mnt/petrelfs/share_data/lidong/data/enc-red/8k", cache_dir=training_args.cache_dir)
-    elif training_args.model_max_length == 16384:
-        dataset = load_dataset("/mnt/petrelfs/yangchenyu/RedPajama-Data-1T-Sample", cache_dir=training_args.cache_dir)
-        dataset = dataset.map(partial(tokenize_fn,tokenizer), num_proc=128, remove_columns=["text", "meta"])
-        dataset.save_to_disk("enc-red/16k")         
-    elif training_args.model_max_length == 32768:
-        dataset = load_dataset("/mnt/petrelfs/share_data/lidong/data/enc-red/32k", cache_dir=training_args.cache_dir)
+    # dataset = load_dataset("togethercomputer/RedPajama-Data-1T-Sample", cache_dir=training_args.cache_dir)
+    # dataset = dataset.map(partial(tokenize_fn,tokenizer),batched=True, num_proc=128, remove_columns=["text", "meta"])
+    if not training_args.local_training_path:
+        dataset = load_dataset(training_args.train_data, cache_dir=training_args.cache_dir)
+        dataset = dataset.map(partial(tokenize_fn, tokenizer),batched=True, num_proc=128, remove_columns=["text", "meta"])
+        # dataset.save_to_disk(some/path)
+    else:
+    # off-line load    
+        len_version = training_args.model_max_length // 1024
+        encoded_path = f"{training_args.local_training_path}/{len_version}k"
+        print_fn(f"loading dataset from {encoded_path}...")
+        dataset = load_dataset(encoded_path)
 
-        
+
     if rank == 0:
         barrier()
 
-    print(dataset)
+    print_fn(dataset)
 
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
@@ -220,22 +244,35 @@ def train():
         model = get_peft_model(model, config)
         # enable trainable params
         [p.requires_grad_() for n, p in model.named_parameters() if any([k in n for k in training_args.trainable_params.split(",")])]
+    model.print_trainable_parameters()
 
     model.config.use_cache = False         # required for gradient checkpointing
     model.enable_input_require_grads()     # required for gradient checkpointing
     model.gradient_checkpointing_enable()  # enable gradient checkpointing
+
+    print_fn(model)
+    # old_state_dict = model.state_dict
+    # model.state_dict = (
+    #     lambda self, *_, **__: get_peft_model_state_dict(
+    #         self, old_state_dict()
+    #     )
+    # ).__get__(model, type(model))
+
     trainer = Trainer(
         model=model, tokenizer=tokenizer, args=training_args,
         train_dataset=dataset["train"],
         eval_dataset=None,
         data_collator=data_collator)
-    train_result = trainer.train(resume_from_checkpoint=last_checkpoint)
-    if training_args.use_log_metrics:
-        trainer.log_metrics("train", train_result.metrics)
-        trainer.save_metrics("train", train_result.metrics)
+    
+    resume_from_checkpoint = training_args.resume if last_checkpoint is not None else False
+    train_result = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    metrics = train_result.metrics
+
+    trainer.log_metrics("train", metrics)
+    trainer.save_metrics("train", metrics)
+
     trainer.save_state()
     trainer.save_model(output_dir=training_args.output_dir)
-
 
 if __name__ == "__main__":
     train()
